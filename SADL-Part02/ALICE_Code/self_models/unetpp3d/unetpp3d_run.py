@@ -1,0 +1,229 @@
+import os
+import argparse
+import time
+import pandas as pd
+import torch
+import torch.nn as nn
+import wandb
+from monai.data import Dataset, DataLoader
+from monai.losses import DiceLoss
+from monai.metrics import DiceMetric
+from monai.transforms import (
+    Compose, LoadImaged, EnsureChannelFirstd, Spacingd, Orientationd,
+    ScaleIntensityRanged, CropForegroundd, ResizeWithPadOrCropd,
+    ToTensord, Activations, AsDiscrete
+)
+from monai.inferers import sliding_window_inference
+
+# --- Model definition ---
+class ConvBlock(nn.Module):
+    def __init__(self, in_channels, out_channels):
+        super().__init__()
+        self.double_conv = nn.Sequential(
+            nn.Conv3d(in_channels, out_channels, kernel_size=3, padding=1),
+            nn.InstanceNorm3d(out_channels),
+            nn.ReLU(inplace=True),
+            nn.Conv3d(out_channels, out_channels, kernel_size=3, padding=1),
+            nn.InstanceNorm3d(out_channels),
+            nn.ReLU(inplace=True),
+        )
+
+    def forward(self, x):
+        return self.double_conv(x)
+
+class UNetPlusPlus(nn.Module):
+    def __init__(self, input_channels=4, n_classes=1, base_n_filter=32, deep_supervision=False):
+        super().__init__()
+        self.deep_supervision = deep_supervision
+        n1, n2, n3, n4 = base_n_filter, base_n_filter*2, base_n_filter*4, base_n_filter*8
+
+        self.conv0_0 = ConvBlock(input_channels, n1)
+        self.conv1_0 = ConvBlock(n1, n2)
+        self.conv2_0 = ConvBlock(n2, n3)
+        self.conv3_0 = ConvBlock(n3, n4)
+        self.maxpool = nn.MaxPool3d(2, 2)
+
+        self.up1_0 = nn.ConvTranspose3d(n2, n1, 2, 2)
+        self.conv0_1 = ConvBlock(n1*2, n1)
+
+        self.up2_0 = nn.ConvTranspose3d(n3, n2, 2, 2)
+        self.conv1_1 = ConvBlock(n2*2, n2)
+        self.up1_1 = nn.ConvTranspose3d(n2, n1, 2, 2)
+        self.conv0_2 = ConvBlock(n1*3, n1)
+
+        self.up3_0 = nn.ConvTranspose3d(n4, n3, 2, 2)
+        self.conv2_1 = ConvBlock(n3*2, n3)
+        self.up2_1 = nn.ConvTranspose3d(n3, n2, 2, 2)
+        self.conv1_2 = ConvBlock(n2*3, n2)
+        self.up1_2 = nn.ConvTranspose3d(n2, n1, 2, 2)
+        self.conv0_3 = ConvBlock(n1*4, n1)
+
+        self.final = nn.Conv3d(n1, n_classes, kernel_size=1)
+
+    def forward(self, x):
+        x0_0 = self.conv0_0(x)
+        x1_0 = self.conv1_0(self.maxpool(x0_0))
+        x0_1 = self.conv0_1(torch.cat([x0_0, self.up1_0(x1_0)], 1))
+
+        x2_0 = self.conv2_0(self.maxpool(x1_0))
+        x1_1 = self.conv1_1(torch.cat([x1_0, self.up2_0(x2_0)], 1))
+        x0_2 = self.conv0_2(torch.cat([x0_0, x0_1, self.up1_1(x1_1)], 1))
+
+        x3_0 = self.conv3_0(self.maxpool(x2_0))
+        x2_1 = self.conv2_1(torch.cat([x2_0, self.up3_0(x3_0)], 1))
+        x1_2 = self.conv1_2(torch.cat([x1_0, x1_1, self.up2_1(x2_1)], 1))
+        x0_3 = self.conv0_3(torch.cat([x0_0, x0_1, x0_2, self.up1_2(x1_2)], 1))
+
+        return self.final(x0_3)
+
+# --- Data parsing ---
+def get_data(data_dir, id_list):
+    input_names = ['t1', 't2', 'flair', 't1ce']
+    data = []
+    for id_num in id_list:
+        patient_id = f"BraTS20_Training_{int(id_num):03d}"
+        base_dir = os.path.join(data_dir, patient_id)
+        images = [os.path.join(base_dir, f"{patient_id}_{mod}.nii") for mod in input_names]
+        label = os.path.join(base_dir, f"{patient_id}_seg.nii")
+        if not all(os.path.exists(img) for img in images) or not os.path.exists(label):
+            continue
+        data.append({"image": images, "label": label})
+    return data
+
+# --- Main training loop ---
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--data_dir", required=True)
+    parser.add_argument("--train_csv", required=True)
+    parser.add_argument("--val_csv", required=True)
+    parser.add_argument("--max_epochs", type=int, default=10)
+    parser.add_argument("--batch_size", type=int, default=1)
+    parser.add_argument("--fold", type=int, default=None, help="Fold index to use for training and validation")
+    args = parser.parse_args()
+
+    # Wandb login and init
+    wandb.init(
+        project="SeminarAdvancesInDeepLearning",
+        entity="universiteitleiden",
+        config={
+            "epochs": args.max_epochs,
+            "batch_size": args.batch_size,
+            "model": "UNet++ 3D",
+            "patch_size": (64, 64, 64),
+            "optimizer": "AdamW",
+            "lr": 1e-4,
+        },
+        tags=["UNet++", "3D"]
+    )
+
+    train_csv = pd.read_csv(args.train_csv)
+    val_csv = pd.read_csv(args.val_csv)
+
+    if args.fold is not None:
+        train_csv = train_csv[train_csv["fold"] == args.fold]
+        val_csv = val_csv[val_csv["fold"] == args.fold]
+
+    train_ids = train_csv["ID"].tolist()
+    val_ids = val_csv["ID"].tolist()
+
+    train_files = get_data(args.data_dir, train_ids)
+    val_files = get_data(args.data_dir, val_ids)
+    patch_size = (64, 64, 64)
+
+    print(f"Loaded training samples: {len(train_files)}", flush=True)
+    print(f"Loaded validation samples: {len(val_files)}", flush=True)
+
+    train_transforms = Compose([
+        LoadImaged(keys=["image", "label"]),
+        EnsureChannelFirstd(keys=["image", "label"]),
+        Spacingd(keys=["image", "label"], pixdim=(1.5, 1.5, 2.0), mode=("bilinear", "nearest")),
+        Orientationd(keys=["image", "label"], axcodes="RAS"),
+        ScaleIntensityRanged(keys=["image"], a_min=-175, a_max=250, b_min=0.0, b_max=1.0, clip=True),
+        CropForegroundd(keys=["image", "label"], source_key="image"),
+        ResizeWithPadOrCropd(keys=["image", "label"], spatial_size=patch_size),
+        ToTensord(keys=["image", "label"]),
+    ])
+
+    val_transforms = Compose([
+        LoadImaged(keys=["image", "label"]),
+        EnsureChannelFirstd(keys=["image", "label"]),
+        Spacingd(keys=["image", "label"], pixdim=(1.5, 1.5, 2.0), mode=("bilinear", "nearest")),
+        Orientationd(keys=["image", "label"], axcodes="RAS"),
+        ScaleIntensityRanged(keys=["image"], a_min=-175, a_max=250, b_min=0.0, b_max=1.0, clip=True),
+        CropForegroundd(keys=["image", "label"], source_key="image"),
+        ResizeWithPadOrCropd(keys=["image", "label"], spatial_size=patch_size),
+        ToTensord(keys=["image", "label"]),
+    ])
+
+    train_ds = Dataset(train_files, transform=train_transforms)
+    val_ds = Dataset(val_files, transform=val_transforms)
+    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True)
+    val_loader = DataLoader(val_ds, batch_size=1)
+
+    model = UNetPlusPlus(input_channels=4, n_classes=1).to("cuda" if torch.cuda.is_available() else "cpu")
+    device = next(model.parameters()).device
+
+    loss_function = DiceLoss(sigmoid=True)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
+    dice_metric = DiceMetric(include_background=True, reduction="mean")
+    post_pred = Compose([Activations(sigmoid=True), AsDiscrete(threshold=0.5)])
+
+    for epoch in range(args.max_epochs):
+        print(f"Epoch {epoch+1}/{args.max_epochs}", flush=True)
+
+        # --- Training ---
+        model.train()
+        epoch_loss = 0
+        for batch_idx, batch_data in enumerate(train_loader):
+            batch_start = time.time()
+            inputs, labels = batch_data["image"].to(device), batch_data["label"].to(device)
+            optimizer.zero_grad()
+            outputs = model(inputs)
+            loss = loss_function(outputs, labels)
+            loss.backward()
+            optimizer.step()
+            epoch_loss += loss.item()
+            print(f"Batch {batch_idx+1}/{len(train_loader)} - Loss: {loss.item():.4f} - Time: {time.time() - batch_start:.2f}s", flush=True)
+
+        avg_train_loss = epoch_loss / len(train_loader)
+
+        # --- Validation Loss ---
+        model.eval()
+        val_loss = 0.0
+        with torch.no_grad():
+            for val_data in val_loader:
+                val_inputs = val_data["image"].to(device)
+                val_labels = val_data["label"].to(device)
+                val_outputs = model(val_inputs)
+                loss = loss_function(val_outputs, val_labels)
+                val_loss += loss.item()
+
+        avg_val_loss = val_loss / len(val_loader)
+
+        wandb.log({
+            "epoch": epoch + 1,
+            "train_loss": avg_train_loss,
+            "val_loss": avg_val_loss
+        })
+
+        print(f"Train Loss: {avg_train_loss:.4f} | Val Loss: {avg_val_loss:.4f}", flush=True)
+
+    # Final Dice Score
+    model.eval()
+    with torch.no_grad():
+        dice_metric.reset()
+        for val_data in val_loader:
+            val_inputs = val_data["image"].to(device)
+            val_labels = val_data["label"].to(device)
+            val_outputs = sliding_window_inference(val_inputs, patch_size, 1, model)
+            val_outputs = post_pred(val_outputs)
+            dice_metric(y_pred=val_outputs, y=val_labels)
+        final_score = dice_metric.aggregate().item()
+        print(f"Final Validation Dice Score: {final_score:.4f}", flush=True)
+        wandb.log({"final_val_dice_score": final_score})
+        dice_metric.reset()
+
+    wandb.finish()
+
+if __name__ == "__main__":
+    main()

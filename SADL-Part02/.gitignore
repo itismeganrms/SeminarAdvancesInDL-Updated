@@ -1,0 +1,14 @@
+Non-ALICE_Code/Semantic-Segmentation/data/MICCAI_BraTS2020_TrainingData/
+ALICE_Code/SiNGR-tumor/GeodisTK/
+ALICE_Code/SwinUNETR/BRATS21/splits_data_csv/*
+
+ALICE_Code/self_models/wandb
+ALICE_Code/self_models/wandb/*
+
+ALICE_Code/SwinUNETR/BRATS21/wandb
+ALICE_Code/SwinUNETR/BRATS21/wandb/*
+
+ALICE_Code/self_models/unetpp3d/wandb
+ALICE_Code/self_models/unetpp3d/wandb/*
+
+.log
